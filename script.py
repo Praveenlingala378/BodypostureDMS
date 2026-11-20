@@ -1,11 +1,16 @@
+import argparse
 import cv2
+import getpass
 import mediapipe as mp
 import numpy as np
+import os
+import threading
 import time
 import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
 import math
+from urllib.parse import quote, urlsplit, urlunsplit
 
 # MediaPipe Initializations
 mp_face_mesh = mp.solutions.face_mesh
@@ -18,6 +23,89 @@ LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 FACE_3D_POINTS = [1, 152, 33, 263, 61, 291] 
 
+def parse_video_source(value):
+    return int(value) if value.isdigit() else value
+
+def open_video_source(video_source):
+    if isinstance(video_source, str) and video_source.lower().startswith("rtsp://"):
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+        capture = cv2.VideoCapture()
+        capture.open(
+            video_source,
+            cv2.CAP_FFMPEG,
+            [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000,
+            ],
+        )
+    else:
+        capture = cv2.VideoCapture(video_source)
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return capture
+
+def add_rtsp_credentials(url, username, password):
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() != "rtsp" or not parsed.hostname:
+        raise ValueError("Credentials can only be used with a complete RTSP URL.")
+
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    netloc = f"{quote(username, safe='')}:{quote(password, safe='')}@{host}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+class LatestFrameCapture:
+    def __init__(self, video_source):
+        self.video_source = video_source
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._latest_frame = None
+        self._connected = False
+        self._thread = threading.Thread(target=self._capture_frames, daemon=True)
+        self._thread.start()
+
+    def _capture_frames(self):
+        while not self._stop_event.is_set():
+            capture = open_video_source(self.video_source)
+            if not capture.isOpened():
+                capture.release()
+                if self._stop_event.wait(1):
+                    break
+                continue
+
+            with self._lock:
+                self._connected = True
+
+            while not self._stop_event.is_set():
+                ret, frame = capture.read()
+                if not ret:
+                    break
+                with self._lock:
+                    self._latest_frame = frame
+
+            capture.release()
+            with self._lock:
+                self._connected = False
+                self._latest_frame = None
+            self._stop_event.wait(1)
+
+    def read(self):
+        with self._lock:
+            frame = self._latest_frame
+            self._latest_frame = None
+            return frame
+
+    @property
+    def connected(self):
+        with self._lock:
+            return self._connected
+
+    def release(self):
+        self._stop_event.set()
+        self._thread.join(timeout=1)
+
 def calculate_ear(eye_points, landmarks, img_w, img_h):
     pts = [(int(landmarks.landmark[p].x * img_w), int(landmarks.landmark[p].y * img_h)) for p in eye_points]
     v1 = math.hypot(pts[1][0] - pts[5][0], pts[1][1] - pts[5][1])
@@ -29,7 +117,8 @@ class SleepDetectionApp:
     def __init__(self, root, video_source=0):
         self.root = root
         self.root.title("Multi-Signal Sleep Detection Dashboard")
-        self.cap = cv2.VideoCapture(video_source)
+        self.video_source = video_source
+        self.stream = LatestFrameCapture(video_source)
         
         self.ear_start_time = None
         self.head_start_time = None
@@ -43,6 +132,8 @@ class SleepDetectionApp:
     def setup_ui(self):
         self.video_label = tk.Label(self.root)
         self.video_label.grid(row=0, column=0, rowspan=10, padx=10, pady=10)
+        self.stream_status = tk.Label(self.root, text="Connecting to video source...", fg="orange")
+        self.stream_status.grid(row=10, column=0, padx=10, pady=(0, 10))
 
         control_frame = tk.Frame(self.root)
         control_frame.grid(row=0, column=1, sticky="nw", padx=10, pady=10)
@@ -90,6 +181,13 @@ class SleepDetectionApp:
         self.alert_label = tk.Label(control_frame, text="STATUS: ACTIVE", font=("Arial", 16, "bold"), fg="green", bg="black", width=20, pady=10)
         self.alert_label.pack(anchor="w", pady=15)
 
+        self.root.state("zoomed")
+        self.root.update_idletasks()
+        self.video_max_width = max(
+            1, self.root.winfo_screenwidth() - control_frame.winfo_reqwidth() - 80
+        )
+        self.video_max_height = max(1, self.root.winfo_screenheight() - 130)
+
     def calibrate_posture(self):
         self.baseline_slouch = "CALIBRATING"
         self.btn_calibrate.config(text="Calibrated ✅", bg="lightgreen")
@@ -129,11 +227,16 @@ class SleepDetectionApp:
         tk.Button(report_win, text="Dismiss & Resume Monitoring", command=report_win.destroy, font=("Arial", 12), bg="lightgray", height=2).grid(row=3, column=0, columnspan=2, pady=10)
 
     def update_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            self.root.after(10, self.update_frame)
+        frame = self.stream.read()
+        if frame is None:
+            if self.stream.connected:
+                self.stream_status.config(text="Connected; waiting for video frames...", fg="orange")
+            else:
+                self.stream_status.config(text="No video frames; reconnecting...", fg="red")
+            self.root.after(25, self.update_frame)
             return
 
+        self.stream_status.config(text="Video stream connected (low-latency mode)", fg="green")
         frame = cv2.flip(frame, 1)
         raw_frame_copy = frame.copy()
         
@@ -266,18 +369,49 @@ class SleepDetectionApp:
         else:
             self.alert_label.config(text="STATUS: AWAKE", fg="green", bg="black")
 
-        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        display_scale = min(
+            self.video_max_width / w,
+            self.video_max_height / h,
+            1.0,
+        )
+        if display_scale < 1.0:
+            display_size = (int(w * display_scale), int(h * display_scale))
+            display_frame = cv2.resize(frame, display_size, interpolation=cv2.INTER_AREA)
+        else:
+            display_frame = frame
+
+        img = Image.fromarray(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
         imgtk = ImageTk.PhotoImage(image=img)
         self.video_label.imgtk = imgtk
         self.video_label.configure(image=imgtk)
         self.root.after(10, self.update_frame)
 
     def on_closing(self):
-        self.cap.release()
+        self.stream.release()
         self.root.destroy()
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the sleep-detection dashboard.")
+    parser.add_argument(
+        "--source",
+        type=parse_video_source,
+        default=0,
+        help="Camera index or full video URL (for example: rtsp://192.168.0.198:554/<stream-path>)",
+    )
+    parser.add_argument("--username", help="RTSP username (the password is prompted securely)")
+    args = parser.parse_args()
+
+    if args.username:
+        if not isinstance(args.source, str):
+            parser.error("--username requires an RTSP URL passed to --source")
+        try:
+            args.source = add_rtsp_credentials(
+                args.source, args.username, getpass.getpass("RTSP password: ")
+            )
+        except ValueError as error:
+            parser.error(str(error))
+
     root = tk.Tk()
-    app = SleepDetectionApp(root)
+    app = SleepDetectionApp(root, video_source=args.source)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()

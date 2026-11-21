@@ -3,11 +3,10 @@
 import json
 import math
 import os
+import sys
 import time
 import urllib.request
 from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, messagebox
 
 # Force RTSP over TCP where OpenCV's FFmpeg backend is available.
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
@@ -15,9 +14,18 @@ os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 import cv2
 import mediapipe as mp
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    from PIL import ImageTk
+    TK_AVAILABLE = True
+except ImportError:
+    tk = ttk = messagebox = ImageTk = None
+    TK_AVAILABLE = False
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -377,17 +385,172 @@ class SleepDetectionApp:
         self.root.destroy()
 
 
+def run_headless(video_source):
+    """Monitor the RTSP stream from SSH without opening a window."""
+    face_landmarker = vision.FaceLandmarker.create_from_options(
+        vision.FaceLandmarkerOptions(
+            base_options=python.BaseOptions(model_asset_path=str(FACE_MODEL)),
+            running_mode=vision.RunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+    )
+    pose_landmarker = vision.PoseLandmarker.create_from_options(
+        vision.PoseLandmarkerOptions(
+            base_options=python.BaseOptions(model_asset_path=str(POSE_MODEL)),
+            running_mode=vision.RunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+    )
+    cap = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG)
+    print("Headless monitoring started. Press Ctrl+C to stop.", flush=True)
+    print("Posture baseline will be calibrated from the first 20 detected frames; sit upright.", flush=True)
+
+    ear_start = head_start = slouch_start = None
+    last_timestamp_ms = 0
+    last_reconnect = 0.0
+    calibration_samples = []
+    baseline = None
+    alert_active = False
+    last_status = None
+
+    try:
+        while True:
+            if not cap.isOpened():
+                now = time.monotonic()
+                if now - last_reconnect >= 2.0:
+                    cap.release()
+                    cap = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG)
+                    last_reconnect = now
+                status = "Waiting for RTSP stream"
+                if status != last_status:
+                    print(f"[INFO] {status}", flush=True)
+                    last_status = status
+                time.sleep(0.25)
+                continue
+
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                cap.release()
+                ear_start = head_start = slouch_start = None
+                status = "RTSP stream lost; reconnecting"
+                if status != last_status:
+                    print(f"[WARN] {status}", flush=True)
+                    last_status = status
+                time.sleep(0.5)
+                continue
+
+            height, width = frame.shape[:2]
+            if width > 640:
+                frame = cv2.resize(frame, (640, max(1, round(height * 640 / width))),
+                                   interpolation=cv2.INTER_AREA)
+            height, width = frame.shape[:2]
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            timestamp_ms = max(int(time.monotonic() * 1000), last_timestamp_ms + 1)
+            last_timestamp_ms = timestamp_ms
+
+            face_result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
+            pose_result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+            now = time.monotonic()
+            ear_met = head_met = slouch_met = False
+            ear_value = pitch = roll = 0.0
+
+            if face_result.face_landmarks:
+                face = face_result.face_landmarks[0]
+                ear_value = (calculate_ear(LEFT_EYE, face, width, height) +
+                             calculate_ear(RIGHT_EYE, face, width, height)) / 2.0
+                if ear_value <= 0.25:
+                    if ear_start is None:
+                        ear_start = now
+                    ear_met = now - ear_start >= 2.0
+                else:
+                    ear_start = None
+
+                points_2d = np.array([[int(face[i].x * width), int(face[i].y * height)]
+                                      for i in FACE_3D_POINTS], dtype=np.float64)
+                points_3d = np.array([STANDARD_3D[i] for i in FACE_3D_POINTS], dtype=np.float64)
+                camera = np.array([[width, 0, width / 2], [0, width, height / 2], [0, 0, 1]],
+                                  dtype=np.float64)
+                success, rotation, _ = cv2.solvePnP(
+                    points_3d, points_2d, camera, np.zeros((4, 1), dtype=np.float64))
+                if success:
+                    rotation_matrix, _ = cv2.Rodrigues(rotation)
+                    angles, *_ = cv2.RQDecomp3x3(rotation_matrix)
+                    pitch, roll = float(angles[0] * 360), float(angles[2] * 360)
+                    if abs(pitch) >= 12 or abs(roll) >= 12:
+                        if head_start is None:
+                            head_start = now
+                        head_met = now - head_start >= 2.0
+                    else:
+                        head_start = None
+                else:
+                    head_start = None
+            else:
+                ear_start = head_start = None
+
+            if pose_result.pose_landmarks:
+                pose = pose_result.pose_landmarks[0]
+                nose_y = pose[0].y * height
+                shoulder_y = (pose[11].y + pose[12].y) * height / 2.0
+                distance = shoulder_y - nose_y
+                if baseline is None:
+                    if distance > 0:
+                        calibration_samples.append(distance)
+                    if len(calibration_samples) >= 20:
+                        baseline = float(np.median(calibration_samples))
+                        print(f"[INFO] Upright posture baseline calibrated: {baseline:.1f}px", flush=True)
+                elif distance < baseline * 0.8:
+                    if slouch_start is None:
+                        slouch_start = now
+                    slouch_met = now - slouch_start >= 2.0
+                else:
+                    slouch_start = None
+            else:
+                slouch_start = None
+
+            # Preserve the dashboard's multi-signal rule: all enabled checks must meet.
+            is_alert = ear_met and head_met and slouch_met
+            if is_alert and not alert_active:
+                print(f"[ALERT] Sleepiness detected | EAR={ear_value:.2f}, "
+                      f"pitch={pitch:.1f}°, roll={roll:.1f}°", flush=True)
+            elif not is_alert and alert_active:
+                print("[INFO] Alert cleared; monitoring resumed.", flush=True)
+            alert_active = is_alert
+
+            status = "Monitoring RTSP stream" if baseline is not None else "Calibrating posture baseline"
+            if status != last_status:
+                print(f"[INFO] {status}", flush=True)
+                last_status = status
+    except KeyboardInterrupt:
+        print("\nHeadless monitoring stopped.", flush=True)
+    finally:
+        cap.release()
+        face_landmarker.close()
+        pose_landmarker.close()
+
+
 if __name__ == "__main__":
     try:
         source = load_config()
         ensure_models()
-        root = tk.Tk()
-        app = SleepDetectionApp(root, source)
-        root.protocol("WM_DELETE_WINDOW", app.on_closing)
-        root.mainloop()
+        has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        if not TK_AVAILABLE or (sys.platform.startswith("linux") and not has_display):
+            run_headless(source)
+        else:
+            root = tk.Tk()
+            app = SleepDetectionApp(root, source)
+            root.protocol("WM_DELETE_WINDOW", app.on_closing)
+            root.mainloop()
     except Exception as error:
         print(f"Startup failed: {error}")
-        try:
-            messagebox.showerror("Startup failed", str(error))
-        except tk.TclError:
-            pass
+        if TK_AVAILABLE and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            try:
+                messagebox.showerror("Startup failed", str(error))
+            except tk.TclError:
+                pass

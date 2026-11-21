@@ -1,0 +1,5 @@
+config.json
+models/
+__pycache__/
+*.py[cod]
+.venv/

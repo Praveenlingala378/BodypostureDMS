@@ -614,7 +614,7 @@ if __name__ == "__main__":
     try:
         source = load_config()
         ensure_models()
-        has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        has_display = bool(os.environ.get("DISPLAY"))
         if not TK_AVAILABLE or (sys.platform.startswith("linux") and not has_display):
             run_headless(source)
         else:

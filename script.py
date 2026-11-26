@@ -87,27 +87,27 @@ def calculate_ear(eye_points, landmarks, img_w, img_h):
     return (v1 + v2) / (2.0 * width) if width else 0.0
 
 
-def save_detection_image(frame):
-    """Save a camera frame for a confirmed sleepiness event."""
-    DETECTIONS_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    image_path = DETECTIONS_DIR / f"sleepiness_{timestamp}.jpg"
-    if not cv2.imwrite(str(image_path), frame):
-        raise OSError(f"Could not write detection image to {image_path}")
-    return image_path
-
-
 def save_detection_images(raw_frame, annotated_frame):
-    """Save matching raw and annotated frames for a confirmed GUI event."""
+    """Save matching raw, annotated, and side-by-side frames for a GUI event."""
     DETECTIONS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     raw_path = DETECTIONS_DIR / f"sleepiness_{timestamp}.jpg"
     annotated_path = DETECTIONS_DIR / f"sleepiness_{timestamp}_annotated.jpg"
+    comparison_path = DETECTIONS_DIR / f"sleepiness_{timestamp}_comparison.jpg"
     if not cv2.imwrite(str(raw_path), raw_frame):
         raise OSError(f"Could not write detection image to {raw_path}")
     if not cv2.imwrite(str(annotated_path), annotated_frame):
         raise OSError(f"Could not write annotated detection image to {annotated_path}")
-    return raw_path, annotated_path
+    comparison = cv2.hconcat((raw_frame, annotated_frame))
+    header = np.zeros((36, comparison.shape[1], 3), dtype=np.uint8)
+    cv2.putText(header, "Raw camera image", (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                0.65, (255, 255, 255), 2)
+    cv2.putText(header, "Annotated detection", (raw_frame.shape[1] + 10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+    comparison = cv2.vconcat((header, comparison))
+    if not cv2.imwrite(str(comparison_path), comparison):
+        raise OSError(f"Could not write comparison image to {comparison_path}")
+    return raw_path, annotated_path, comparison_path
 
 
 def log_detection_status(monitor_start_time, last_log_time, checks, sleepiness_detected):
@@ -445,9 +445,11 @@ class SleepDetectionApp:
             now = time.monotonic()
             if self.last_capture_time is None or now - self.last_capture_time > 10:
                 try:
-                    raw_path, annotated_path = save_detection_images(raw_frame_copy, frame)
+                    raw_path, annotated_path, comparison_path = save_detection_images(
+                        raw_frame_copy, frame)
                     print(f"[ALERT] Sleepiness image saved: {raw_path}", flush=True)
                     print(f"[ALERT] Annotated image saved: {annotated_path}", flush=True)
+                    print(f"[ALERT] Side-by-side comparison saved: {comparison_path}", flush=True)
                 except (OSError, cv2.error) as error:
                     print(f"[ERROR] Failed to save sleepiness image: {error}", flush=True)
                 self.show_incident_report(raw_frame_copy, frame.copy(), current_ear,
@@ -619,8 +621,38 @@ def run_headless(video_source):
                 print(f"[ALERT] Sleepiness detected | EAR={ear_value:.2f}, "
                       f"pitch={pitch:.1f}°, roll={roll:.1f}°", flush=True)
                 try:
-                    image_path = save_detection_image(frame)
-                    print(f"[ALERT] Sleepiness image saved: {image_path}", flush=True)
+                    annotated_frame = frame.copy()
+                    if face_result.face_landmarks:
+                        face = face_result.face_landmarks[0]
+                        for point_idx in LEFT_EYE + RIGHT_EYE:
+                            point = (int(face[point_idx].x * width),
+                                     int(face[point_idx].y * height))
+                            cv2.circle(annotated_frame, point, 2, (0, 255, 0), -1)
+                        cv2.putText(annotated_frame, f"EAR: {ear_value:.2f} (<= 0.25)",
+                                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.putText(annotated_frame,
+                                    f"Pitch: {int(pitch)} Roll: {int(roll)} (threshold: 12 deg)",
+                                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                    if pose_result.pose_landmarks:
+                        pose = pose_result.pose_landmarks[0]
+                        nose = (int(pose[0].x * width), int(pose[0].y * height))
+                        shoulders = (int((pose[11].x + pose[12].x) / 2 * width),
+                                     int((pose[11].y + pose[12].y) / 2 * height))
+                        cv2.line(annotated_frame, nose, shoulders, (255, 0, 255), 2)
+                        cv2.circle(annotated_frame, shoulders, 5, (255, 0, 255), -1)
+                        cv2.putText(annotated_frame,
+                                    f"Posture distance: {distance:.1f}px "
+                                    f"(baseline: {baseline:.1f}px)",
+                                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                        cv2.putText(annotated_frame, "SLOUCH DETECTED", (10, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    cv2.putText(annotated_frame, "SLEEPINESS DETECTED", (10, height - 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    raw_path, annotated_path, comparison_path = save_detection_images(
+                        frame, annotated_frame)
+                    print(f"[ALERT] Sleepiness image saved: {raw_path}", flush=True)
+                    print(f"[ALERT] Annotated image saved: {annotated_path}", flush=True)
+                    print(f"[ALERT] Side-by-side comparison saved: {comparison_path}", flush=True)
                 except (OSError, cv2.error) as error:
                     print(f"[ERROR] Failed to save sleepiness image: {error}", flush=True)
             elif not is_alert and alert_active:

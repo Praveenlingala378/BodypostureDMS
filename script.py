@@ -39,6 +39,22 @@ MODEL_URLS = {
     FACE_MODEL: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
     POSE_MODEL: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
 }
+THRESHOLD_DEFAULTS = {
+    "ear_ratio": 0.25,
+    "ear_duration_seconds": 2.0,
+    "head_angle_degrees": 12.0,
+    "head_duration_seconds": 2.0,
+    "slouch_baseline_ratio": 0.8,
+    "slouch_duration_seconds": 2.0,
+}
+THRESHOLD_LIMITS = {
+    "ear_ratio": (0.15, 0.35),
+    "ear_duration_seconds": (1.0, 5.0),
+    "head_angle_degrees": (5.0, 30.0),
+    "head_duration_seconds": (1.0, 5.0),
+    "slouch_baseline_ratio": (0.1, 1.0),
+    "slouch_duration_seconds": (1.0, 5.0),
+}
 
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
@@ -50,7 +66,7 @@ STANDARD_3D = {
 
 
 def load_config():
-    """Load camera settings from the config file beside this script."""
+    """Load camera and detection settings from the config file beside this script."""
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as config_file:
             config = json.load(config_file)
@@ -59,10 +75,32 @@ def load_config():
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"{CONFIG_PATH.name} is not valid JSON: {exc}") from exc
 
+    if not isinstance(config, dict):
+        raise RuntimeError(f"{CONFIG_PATH.name} must contain a JSON object.")
+
     source = str(config.get("rtsp_url", "")).strip()
     if not source.startswith(("rtsp://", "rtsps://")):
         raise RuntimeError('Set "rtsp_url" in config.json to a valid rtsp:// or rtsps:// URL.')
-    return source
+
+    configured_thresholds = config.get("thresholds", {})
+    if not isinstance(configured_thresholds, dict):
+        raise RuntimeError('"thresholds" in config.json must be a JSON object.')
+    unknown_thresholds = set(configured_thresholds) - set(THRESHOLD_DEFAULTS)
+    if unknown_thresholds:
+        names = ", ".join(sorted(unknown_thresholds))
+        raise RuntimeError(f"Unknown detection threshold(s) in config.json: {names}")
+
+    thresholds = {}
+    for name, default in THRESHOLD_DEFAULTS.items():
+        value = configured_thresholds.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise RuntimeError(f'"thresholds.{name}" in config.json must be a finite number.')
+        minimum, maximum = THRESHOLD_LIMITS[name]
+        if not minimum <= value <= maximum:
+            raise RuntimeError(
+                f'"thresholds.{name}" must be between {minimum} and {maximum}.')
+        thresholds[name] = float(value)
+    return source, thresholds
 
 
 def ensure_models():
@@ -87,17 +125,11 @@ def calculate_ear(eye_points, landmarks, img_w, img_h):
     return (v1 + v2) / (2.0 * width) if width else 0.0
 
 
-def save_detection_images(raw_frame, annotated_frame):
-    """Save matching raw, annotated, and side-by-side frames for a GUI event."""
+def save_detection_comparison(raw_frame, annotated_frame):
+    """Save raw and annotated frames together as one comparison image."""
     DETECTIONS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    raw_path = DETECTIONS_DIR / f"sleepiness_{timestamp}.jpg"
-    annotated_path = DETECTIONS_DIR / f"sleepiness_{timestamp}_annotated.jpg"
     comparison_path = DETECTIONS_DIR / f"sleepiness_{timestamp}_comparison.jpg"
-    if not cv2.imwrite(str(raw_path), raw_frame):
-        raise OSError(f"Could not write detection image to {raw_path}")
-    if not cv2.imwrite(str(annotated_path), annotated_frame):
-        raise OSError(f"Could not write annotated detection image to {annotated_path}")
     comparison = cv2.hconcat((raw_frame, annotated_frame))
     header = np.zeros((36, comparison.shape[1], 3), dtype=np.uint8)
     cv2.putText(header, "Raw camera image", (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
@@ -107,7 +139,7 @@ def save_detection_images(raw_frame, annotated_frame):
     comparison = cv2.vconcat((header, comparison))
     if not cv2.imwrite(str(comparison_path), comparison):
         raise OSError(f"Could not write comparison image to {comparison_path}")
-    return raw_path, annotated_path, comparison_path
+    return comparison_path
 
 
 def log_detection_status(monitor_start_time, last_log_time, checks, sleepiness_detected):
@@ -142,9 +174,10 @@ def log_detection_status(monitor_start_time, last_log_time, checks, sleepiness_d
 
 
 class SleepDetectionApp:
-    def __init__(self, root, video_source):
+    def __init__(self, root, video_source, thresholds):
         self.root = root
         self.video_source = video_source
+        self.thresholds = thresholds
         self.root.title("Multi-Signal Sleep Detection Dashboard")
         self.cap = self.open_capture()
 
@@ -198,11 +231,11 @@ class SleepDetectionApp:
                        font=("Arial", 10, "bold")).pack(anchor="w")
         self.ear_thresh = tk.Scale(control_frame, from_=0.15, to=0.35, resolution=0.01,
                                    orient="horizontal", label="EAR Threshold (<=)")
-        self.ear_thresh.set(0.25)
+        self.ear_thresh.set(self.thresholds["ear_ratio"])
         self.ear_thresh.pack(anchor="w", fill="x")
         self.ear_time = tk.Scale(control_frame, from_=1, to=5, resolution=0.5,
                                  orient="horizontal", label="EAR Duration (sec)")
-        self.ear_time.set(2.0)
+        self.ear_time.set(self.thresholds["ear_duration_seconds"])
         self.ear_time.pack(anchor="w", fill="x")
         ttk.Separator(control_frame, orient="horizontal").pack(fill="x", pady=5)
 
@@ -211,11 +244,11 @@ class SleepDetectionApp:
                        font=("Arial", 10, "bold")).pack(anchor="w")
         self.hpm_thresh = tk.Scale(control_frame, from_=5, to=30, resolution=1,
                                    orient="horizontal", label="Pitch/Roll Degrees (>=)")
-        self.hpm_thresh.set(12)
+        self.hpm_thresh.set(self.thresholds["head_angle_degrees"])
         self.hpm_thresh.pack(anchor="w", fill="x")
         self.hpm_time = tk.Scale(control_frame, from_=1, to=5, resolution=0.5,
                                  orient="horizontal", label="HPM Duration (sec)")
-        self.hpm_time.set(2.0)
+        self.hpm_time.set(self.thresholds["head_duration_seconds"])
         self.hpm_time.pack(anchor="w", fill="x")
         ttk.Separator(control_frame, orient="horizontal").pack(fill="x", pady=5)
 
@@ -224,7 +257,7 @@ class SleepDetectionApp:
                        font=("Arial", 10, "bold")).pack(anchor="w")
         self.slouch_time = tk.Scale(control_frame, from_=1, to=5, resolution=0.5,
                                     orient="horizontal", label="Slouch Duration (sec)")
-        self.slouch_time.set(2.0)
+        self.slouch_time.set(self.thresholds["slouch_duration_seconds"])
         self.slouch_time.pack(anchor="w", fill="x")
         self.btn_calibrate = tk.Button(control_frame, text="Calibrate Upright Posture",
                                        command=self.calibrate_posture, bg="lightblue")
@@ -274,7 +307,8 @@ class SleepDetectionApp:
         )
         posture_reason = (
             f"Posture: {current_dist:.1f}px ({slouch_pct:.1f}% of "
-            f"{baseline:.1f}px upright baseline; alert below 80%) "
+            f"{baseline:.1f}px upright baseline; alert below "
+            f"{self.thresholds['slouch_baseline_ratio'] * 100:.0f}%) "
             f"for {self.slouch_time.get():.1f}s (met)"
             if self.toggle_slouch.get() else "Posture: disabled"
         )
@@ -395,7 +429,7 @@ class SleepDetectionApp:
                     self.calibration_samples = None
                     self.btn_calibrate.config(text="Upright Posture Calibrated", bg="lightgreen")
             if self.baseline_slouch and self.baseline_slouch > 0:
-                if current_dist < self.baseline_slouch * 0.8:
+                if current_dist < self.baseline_slouch * self.thresholds["slouch_baseline_ratio"]:
                     cv2.putText(frame, "SLOUCH DETECTED", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                     if self.slouch_start_time is None:
                         self.slouch_start_time = time.monotonic()
@@ -445,10 +479,7 @@ class SleepDetectionApp:
             now = time.monotonic()
             if self.last_capture_time is None or now - self.last_capture_time > 10:
                 try:
-                    raw_path, annotated_path, comparison_path = save_detection_images(
-                        raw_frame_copy, frame)
-                    print(f"[ALERT] Sleepiness image saved: {raw_path}", flush=True)
-                    print(f"[ALERT] Annotated image saved: {annotated_path}", flush=True)
+                    comparison_path = save_detection_comparison(raw_frame_copy, frame)
                     print(f"[ALERT] Side-by-side comparison saved: {comparison_path}", flush=True)
                 except (OSError, cv2.error) as error:
                     print(f"[ERROR] Failed to save sleepiness image: {error}", flush=True)
@@ -473,8 +504,14 @@ class SleepDetectionApp:
         self.root.destroy()
 
 
-def run_headless(video_source):
+def run_headless(video_source, thresholds):
     """Monitor the RTSP stream from SSH without opening a window."""
+    ear_threshold = thresholds["ear_ratio"]
+    ear_duration = thresholds["ear_duration_seconds"]
+    head_angle_threshold = thresholds["head_angle_degrees"]
+    head_duration = thresholds["head_duration_seconds"]
+    slouch_ratio = thresholds["slouch_baseline_ratio"]
+    slouch_duration = thresholds["slouch_duration_seconds"]
     face_landmarker = vision.FaceLandmarker.create_from_options(
         vision.FaceLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path=str(FACE_MODEL)),
@@ -556,11 +593,11 @@ def run_headless(video_source):
                 face = face_result.face_landmarks[0]
                 ear_value = (calculate_ear(LEFT_EYE, face, width, height) +
                              calculate_ear(RIGHT_EYE, face, width, height)) / 2.0
-                if ear_value <= 0.25:
+                if ear_value <= ear_threshold:
                     if ear_start is None:
                         ear_start = now
                     ear_elapsed = now - ear_start
-                    ear_met = ear_elapsed >= 2.0
+                    ear_met = ear_elapsed >= ear_duration
                 else:
                     ear_start = None
 
@@ -575,11 +612,11 @@ def run_headless(video_source):
                     rotation_matrix, _ = cv2.Rodrigues(rotation)
                     angles, *_ = cv2.RQDecomp3x3(rotation_matrix)
                     pitch, roll = float(angles[0] * 360), float(angles[2] * 360)
-                    if abs(pitch) >= 12 or abs(roll) >= 12:
+                    if abs(pitch) >= head_angle_threshold or abs(roll) >= head_angle_threshold:
                         if head_start is None:
                             head_start = now
                         head_elapsed = now - head_start
-                        head_met = head_elapsed >= 2.0
+                        head_met = head_elapsed >= head_duration
                     else:
                         head_start = None
                 else:
@@ -598,11 +635,11 @@ def run_headless(video_source):
                     if len(calibration_samples) >= 20:
                         baseline = float(np.median(calibration_samples))
                         print(f"[INFO] Upright posture baseline calibrated: {baseline:.1f}px", flush=True)
-                elif distance < baseline * 0.8:
+                elif distance < baseline * slouch_ratio:
                     if slouch_start is None:
                         slouch_start = now
                     slouch_elapsed = now - slouch_start
-                    slouch_met = slouch_elapsed >= 2.0
+                    slouch_met = slouch_elapsed >= slouch_duration
                 else:
                     slouch_start = None
             else:
@@ -611,9 +648,9 @@ def run_headless(video_source):
             # Preserve the dashboard's multi-signal rule: all enabled checks must meet.
             is_alert = ear_met and head_met and slouch_met
             status_checks = [
-                ("EAR", True, ear_met, ear_start, ear_elapsed, 2.0),
-                ("HPM", True, head_met, head_start, head_elapsed, 2.0),
-                ("SLOUCH", True, slouch_met, slouch_start, slouch_elapsed, 2.0),
+                ("EAR", True, ear_met, ear_start, ear_elapsed, ear_duration),
+                ("HPM", True, head_met, head_start, head_elapsed, head_duration),
+                ("SLOUCH", True, slouch_met, slouch_start, slouch_elapsed, slouch_duration),
             ]
             last_status_log_time = log_detection_status(
                 monitor_start_time, last_status_log_time, status_checks, is_alert)
@@ -628,10 +665,12 @@ def run_headless(video_source):
                             point = (int(face[point_idx].x * width),
                                      int(face[point_idx].y * height))
                             cv2.circle(annotated_frame, point, 2, (0, 255, 0), -1)
-                        cv2.putText(annotated_frame, f"EAR: {ear_value:.2f} (<= 0.25)",
+                        cv2.putText(annotated_frame,
+                                    f"EAR: {ear_value:.2f} (<= {ear_threshold:.2f})",
                                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                         cv2.putText(annotated_frame,
-                                    f"Pitch: {int(pitch)} Roll: {int(roll)} (threshold: 12 deg)",
+                                    f"Pitch: {int(pitch)} Roll: {int(roll)} "
+                                    f"(threshold: {head_angle_threshold:.1f} deg)",
                                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
                     if pose_result.pose_landmarks:
                         pose = pose_result.pose_landmarks[0]
@@ -642,16 +681,14 @@ def run_headless(video_source):
                         cv2.circle(annotated_frame, shoulders, 5, (255, 0, 255), -1)
                         cv2.putText(annotated_frame,
                                     f"Posture distance: {distance:.1f}px "
-                                    f"(baseline: {baseline:.1f}px)",
+                                    f"(baseline: {baseline:.1f}px; "
+                                    f"alert below {slouch_ratio * 100:.0f}%)",
                                     (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
                         cv2.putText(annotated_frame, "SLOUCH DETECTED", (10, 120),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                     cv2.putText(annotated_frame, "SLEEPINESS DETECTED", (10, height - 15),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                    raw_path, annotated_path, comparison_path = save_detection_images(
-                        frame, annotated_frame)
-                    print(f"[ALERT] Sleepiness image saved: {raw_path}", flush=True)
-                    print(f"[ALERT] Annotated image saved: {annotated_path}", flush=True)
+                    comparison_path = save_detection_comparison(frame, annotated_frame)
                     print(f"[ALERT] Side-by-side comparison saved: {comparison_path}", flush=True)
                 except (OSError, cv2.error) as error:
                     print(f"[ERROR] Failed to save sleepiness image: {error}", flush=True)
@@ -673,14 +710,14 @@ def run_headless(video_source):
 
 if __name__ == "__main__":
     try:
-        source = load_config()
+        source, thresholds = load_config()
         ensure_models()
         has_display = bool(os.environ.get("DISPLAY"))
         if not TK_AVAILABLE or (sys.platform.startswith("linux") and not has_display):
-            run_headless(source)
+            run_headless(source, thresholds)
         else:
             root = tk.Tk()
-            app = SleepDetectionApp(root, source)
+            app = SleepDetectionApp(root, source, thresholds)
             root.protocol("WM_DELETE_WINDOW", app.on_closing)
             root.mainloop()
     except Exception as error:

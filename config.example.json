@@ -1,3 +1,11 @@
 {
-  "rtsp_url": "rtsp://username:password@192.168.1.100:554/stream"
+  "rtsp_url": "rtsp://username:password@192.168.1.100:554/stream",
+  "thresholds": {
+    "ear_ratio": 0.25,
+    "ear_duration_seconds": 2.0,
+    "head_angle_degrees": 12.0,
+    "head_duration_seconds": 2.0,
+    "slouch_baseline_ratio": 0.8,
+    "slouch_duration_seconds": 2.0
+  }
 }

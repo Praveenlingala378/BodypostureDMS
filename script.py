@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 # Force RTSP over TCP where OpenCV's FFmpeg backend is available.
@@ -30,6 +31,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
+DETECTIONS_DIR = APP_DIR / "detections"
 MODEL_DIR = APP_DIR / "models"
 FACE_MODEL = MODEL_DIR / "face_landmarker.task"
 POSE_MODEL = MODEL_DIR / "pose_landmarker_lite.task"
@@ -85,6 +87,47 @@ def calculate_ear(eye_points, landmarks, img_w, img_h):
     return (v1 + v2) / (2.0 * width) if width else 0.0
 
 
+def save_detection_image(frame):
+    """Save a camera frame for a confirmed sleepiness event."""
+    DETECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    image_path = DETECTIONS_DIR / f"sleepiness_{timestamp}.jpg"
+    if not cv2.imwrite(str(image_path), frame):
+        raise OSError(f"Could not write detection image to {image_path}")
+    return image_path
+
+
+def log_detection_status(monitor_start_time, last_log_time, checks, sleepiness_detected):
+    """Print detection progress once per second with time since monitoring began."""
+    now = time.monotonic()
+    if last_log_time is not None and now - last_log_time < 1.0:
+        return last_log_time
+
+    check_logs = []
+    waiting_checks = []
+    for name, enabled, triggered, start_time, elapsed, duration in checks:
+        if not enabled:
+            check_logs.append(f"{name}=DISABLED")
+        elif triggered:
+            check_logs.append(f"{name}=TRIGGERED ({elapsed:.1f}/{duration:.1f}s)")
+        elif start_time is not None:
+            check_logs.append(f"{name}=NOT TRIGGERED (in progress {elapsed:.1f}/{duration:.1f}s)")
+            waiting_checks.append(name)
+        else:
+            check_logs.append(f"{name}=NOT TRIGGERED (inactive; 0.0/{duration:.1f}s)")
+            waiting_checks.append(name)
+
+    if sleepiness_detected:
+        overall_status = "SLEEPINESS=DETECTED"
+    else:
+        waiting = ", ".join(waiting_checks) if waiting_checks else "no active checks"
+        overall_status = f"SLEEPINESS=NOT DETECTED (waiting: {waiting})"
+
+    timeline = now - monitor_start_time
+    print(f"[T+{timeline:.1f}s] {' | '.join(check_logs)} | {overall_status}", flush=True)
+    return now
+
+
 class SleepDetectionApp:
     def __init__(self, root, video_source):
         self.root = root
@@ -118,10 +161,12 @@ class SleepDetectionApp:
         self.slouch_start_time = None
         self.baseline_slouch = None
         self.calibration_samples = None
-        self.last_capture_time = 0.0
+        self.last_capture_time = None
         self.last_timestamp_ms = 0
         self.last_reconnect_attempt = 0.0
         self.frame_count = 0
+        self.monitor_start_time = time.monotonic()
+        self.last_status_log_time = None
         self.setup_ui()
         self.update_frame()
 
@@ -361,12 +406,24 @@ class SleepDetectionApp:
 
         enabled_criteria = [enabled for enabled, *_ in criteria]
         detection_confirmed = any(enabled_criteria) and all((not enabled) or met for enabled, met, *_ in criteria)
+        status_checks = [
+            (name, enabled, triggered, start_time, elapsed, duration)
+            for enabled, triggered, start_time, elapsed, _, name, duration in criteria
+        ]
+        self.last_status_log_time = log_detection_status(
+            self.monitor_start_time, self.last_status_log_time, status_checks, detection_confirmed)
         if detection_confirmed:
             self.alert_label.config(text="SLEEPINESS DETECTED", fg="white", bg="red")
-            if time.monotonic() - self.last_capture_time > 10:
+            now = time.monotonic()
+            if self.last_capture_time is None or now - self.last_capture_time > 10:
+                try:
+                    image_path = save_detection_image(raw_frame_copy)
+                    print(f"[ALERT] Sleepiness image saved: {image_path}", flush=True)
+                except (OSError, cv2.error) as error:
+                    print(f"[ERROR] Failed to save sleepiness image: {error}", flush=True)
                 self.show_incident_report(raw_frame_copy, frame.copy(), current_ear,
                                           current_pitch, current_roll, current_dist, self.baseline_slouch)
-                self.last_capture_time = time.monotonic()
+                self.last_capture_time = now
                 self.ear_start_time = self.head_start_time = self.slouch_start_time = None
         else:
             self.alert_label.config(text="STATUS: AWAKE", fg="green", bg="black")
@@ -412,6 +469,8 @@ def run_headless(video_source):
     print("Posture baseline will be calibrated from the first 20 detected frames; sit upright.", flush=True)
 
     ear_start = head_start = slouch_start = None
+    monitor_start_time = time.monotonic()
+    last_status_log_time = None
     last_timestamp_ms = 0
     last_reconnect = 0.0
     calibration_samples = []
@@ -459,6 +518,7 @@ def run_headless(video_source):
             pose_result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
             now = time.monotonic()
             ear_met = head_met = slouch_met = False
+            ear_elapsed = head_elapsed = slouch_elapsed = 0.0
             ear_value = pitch = roll = 0.0
 
             if face_result.face_landmarks:
@@ -468,7 +528,8 @@ def run_headless(video_source):
                 if ear_value <= 0.25:
                     if ear_start is None:
                         ear_start = now
-                    ear_met = now - ear_start >= 2.0
+                    ear_elapsed = now - ear_start
+                    ear_met = ear_elapsed >= 2.0
                 else:
                     ear_start = None
 
@@ -486,7 +547,8 @@ def run_headless(video_source):
                     if abs(pitch) >= 12 or abs(roll) >= 12:
                         if head_start is None:
                             head_start = now
-                        head_met = now - head_start >= 2.0
+                        head_elapsed = now - head_start
+                        head_met = head_elapsed >= 2.0
                     else:
                         head_start = None
                 else:
@@ -508,7 +570,8 @@ def run_headless(video_source):
                 elif distance < baseline * 0.8:
                     if slouch_start is None:
                         slouch_start = now
-                    slouch_met = now - slouch_start >= 2.0
+                    slouch_elapsed = now - slouch_start
+                    slouch_met = slouch_elapsed >= 2.0
                 else:
                     slouch_start = None
             else:
@@ -516,9 +579,21 @@ def run_headless(video_source):
 
             # Preserve the dashboard's multi-signal rule: all enabled checks must meet.
             is_alert = ear_met and head_met and slouch_met
+            status_checks = [
+                ("EAR", True, ear_met, ear_start, ear_elapsed, 2.0),
+                ("HPM", True, head_met, head_start, head_elapsed, 2.0),
+                ("SLOUCH", True, slouch_met, slouch_start, slouch_elapsed, 2.0),
+            ]
+            last_status_log_time = log_detection_status(
+                monitor_start_time, last_status_log_time, status_checks, is_alert)
             if is_alert and not alert_active:
                 print(f"[ALERT] Sleepiness detected | EAR={ear_value:.2f}, "
                       f"pitch={pitch:.1f}°, roll={roll:.1f}°", flush=True)
+                try:
+                    image_path = save_detection_image(frame)
+                    print(f"[ALERT] Sleepiness image saved: {image_path}", flush=True)
+                except (OSError, cv2.error) as error:
+                    print(f"[ERROR] Failed to save sleepiness image: {error}", flush=True)
             elif not is_alert and alert_active:
                 print("[INFO] Alert cleared; monitoring resumed.", flush=True)
             alert_active = is_alert

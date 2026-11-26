@@ -97,6 +97,19 @@ def save_detection_image(frame):
     return image_path
 
 
+def save_detection_images(raw_frame, annotated_frame):
+    """Save matching raw and annotated frames for a confirmed GUI event."""
+    DETECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    raw_path = DETECTIONS_DIR / f"sleepiness_{timestamp}.jpg"
+    annotated_path = DETECTIONS_DIR / f"sleepiness_{timestamp}_annotated.jpg"
+    if not cv2.imwrite(str(raw_path), raw_frame):
+        raise OSError(f"Could not write detection image to {raw_path}")
+    if not cv2.imwrite(str(annotated_path), annotated_frame):
+        raise OSError(f"Could not write annotated detection image to {annotated_path}")
+    return raw_path, annotated_path
+
+
 def log_detection_status(monitor_start_time, last_log_time, checks, sleepiness_detected):
     """Print detection progress once per second with time since monitoring began."""
     now = time.monotonic()
@@ -248,11 +261,26 @@ class SleepDetectionApp:
         tk.Label(report_win, image=raw_tk).grid(row=1, column=0, padx=10)
         tk.Label(report_win, image=ann_tk).grid(row=1, column=1, padx=10)
         slouch_pct = (current_dist / baseline) * 100 if baseline and baseline > 0 else 100
-        reason = ("--- INCIDENT LOG ---\n"
-                  f"1. Eye Aspect Ratio: {ear_val:.2f} for over {self.ear_time.get()}s.\n"
-                  f"2. Head Pose: Pitch {int(pitch_val)}° / Roll {int(roll_val)}° for over {self.hpm_time.get()}s.\n"
-                  f"3. Body Posture: {slouch_pct:.1f}% of calibrated upright distance for over {self.slouch_time.get()}s.\n"
-                  "CONCLUSION: Enabled multi-signal checks confirmed a drowsiness event.")
+        ear_reason = (
+            f"EAR: {ear_val:.2f} <= {self.ear_thresh.get():.2f} "
+            f"for {self.ear_time.get():.1f}s (met)"
+            if self.toggle_ear.get() else "EAR: disabled"
+        )
+        hpm_reason = (
+            f"Head pose: pitch {int(pitch_val)}° / roll {int(roll_val)}°; "
+            f"absolute angle >= {self.hpm_thresh.get():.0f}° "
+            f"for {self.hpm_time.get():.1f}s (met)"
+            if self.toggle_hpm.get() else "Head pose: disabled"
+        )
+        posture_reason = (
+            f"Posture: {current_dist:.1f}px ({slouch_pct:.1f}% of "
+            f"{baseline:.1f}px upright baseline; alert below 80%) "
+            f"for {self.slouch_time.get():.1f}s (met)"
+            if self.toggle_slouch.get() else "Posture: disabled"
+        )
+        reason = ("--- WHY THIS EVENT WAS DETECTED ---\n"
+                  f"{ear_reason}\n{hpm_reason}\n{posture_reason}\n"
+                  "CONCLUSION: Every enabled check had to meet its threshold.")
         tk.Label(report_win, text=reason, font=("Consolas", 11, "bold"), justify="left",
                  fg="darkred", bg="#ffe6e6", padx=10, pady=10).grid(row=2, column=0, columnspan=2, pady=20, sticky="ew")
         tk.Button(report_win, text="Dismiss & Resume Monitoring", command=report_win.destroy,
@@ -417,8 +445,9 @@ class SleepDetectionApp:
             now = time.monotonic()
             if self.last_capture_time is None or now - self.last_capture_time > 10:
                 try:
-                    image_path = save_detection_image(raw_frame_copy)
-                    print(f"[ALERT] Sleepiness image saved: {image_path}", flush=True)
+                    raw_path, annotated_path = save_detection_images(raw_frame_copy, frame)
+                    print(f"[ALERT] Sleepiness image saved: {raw_path}", flush=True)
+                    print(f"[ALERT] Annotated image saved: {annotated_path}", flush=True)
                 except (OSError, cv2.error) as error:
                     print(f"[ERROR] Failed to save sleepiness image: {error}", flush=True)
                 self.show_incident_report(raw_frame_copy, frame.copy(), current_ear,
